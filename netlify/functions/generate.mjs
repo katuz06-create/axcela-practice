@@ -20,23 +20,29 @@ function errors(q,p,points){let a=[];if(!q||typeof q!=='object')return ['missing
 async function call(key,model,sys,user,signal){let response=await fetch('https://api.openai.com/v1/chat/completions',{method:'POST',signal,headers:{Authorization:`Bearer ${key}`,'Content-Type':'application/json'},body:JSON.stringify({model,response_format:{type:'json_object'},temperature:0.25,messages:[{role:'system',content:'Return a valid JSON object only. JSON is required. '+sys},{role:'user',content:'Return JSON only for this input: '+JSON.stringify(user)}]})});let obj=await response.json().catch(()=>({}));if(!response.ok)throw Error(obj.error?.message||`OpenAI HTTP ${response.status}`);let v;try{v=JSON.parse(obj.choices?.[0]?.message?.content||'{}')}catch{throw Error('OpenAI returned invalid JSON')}return v}
 // Grammar Engine V1: controlled question types; five individually generated items per mini.
 const GRAMMAR_FORMATS = [
-  { name:'Choose the correct verb form', instruction:'Choose the correct grammatical form to complete the workplace sentence.' },
-  { name:'Complete the sentence', instruction:'Choose the option that correctly completes the gap in the workplace sentence.' },
-  { name:'Rearrange the words', instruction:'Choose the option that puts the given words in the correct order to form a natural English sentence.' },
-  { name:'Transform the sentence', instruction:'Choose the correct sentence transformation using the stated grammar rule without changing the intended meaning.' }
+  { name:'Fill in the blank', instruction:'Complete the sentence by choosing the best option.' },
+  { name:'Choose the correct answer', instruction:'Choose the single best answer.' },
+  { name:'Sentence transformation', instruction:'Choose the sentence that correctly rewrites the original without changing its meaning.' },
+  { name:'Reading and summarizing', instruction:'Read the passage and choose the best summary.' }
 ];
 function grammarCheck(item, chosenPoint, group) {
-  const problems=[];
-  if (!item || typeof item !== 'object' || Array.isArray(item)) return ['missing question object'];
-  const equal = s => String(s||'').trim().toLowerCase().replace(/\s+/g,' ');
-  if (equal(item.learning_point)!==equal(chosenPoint)) problems.push('learning_point mismatch');
-  if (!Array.isArray(item.a)||item.a.length!==4||item.a.some(x=>typeof x!=='string'||x.trim().length<2)||new Set((item.a||[]).map(equal)).size!==4) problems.push('four distinct nonempty answers required');
-  if (!Number.isInteger(item.ok)||item.ok<0||item.ok>3)problems.push('ok must be integer 0-3');
-  if (typeof item.stem!=='string'||item.stem.trim().length<12)problems.push('stem must contain workplace context and task data');
-  if (typeof item.why!=='string'||item.why.trim().length<18)problems.push('specific explanation missing');
-  if (group===2 && (typeof item.words!=='string'||item.words.trim().split(/\s+/).length<5)) problems.push('word bank required for rearrange');
-  if (group===3 && (typeof item.rule!=='string'||item.rule.trim().length<5)) problems.push('transformation rule required');
-  return problems;
+ const problems=[];
+ if (!item || typeof item !== 'object' || Array.isArray(item)) return ['missing question object'];
+ const equal = s=>String(s||'').trim().toLowerCase().replace(/[^\p{L}\p{N} ]/gu,'').replace(/\s+/g,' ');
+ if(equal(item.learning_point)!==equal(chosenPoint))problems.push('learning point mismatch');
+ if(!Array.isArray(item.a)||item.a.length!==4||item.a.some(x=>typeof x!=='string'||x.trim().length<3)||new Set((item.a||[]).map(equal)).size!==4)problems.push('four unique answers required');
+ if(!Number.isInteger(item.ok)||item.ok<0||item.ok>3)problems.push('invalid answer index');
+ if(typeof item.stem!=='string'||item.stem.trim().length<16)problems.push('missing prompt');
+ if(typeof item.why!=='string'||item.why.trim().length<18)problems.push('missing explanation');
+ if(group===0&&!item.stem.includes('____'))problems.push('blank marker required');
+ if(group===2){if(typeof item.rule!=='string'||item.rule.trim().length<4)problems.push('transformation rule required');}
+ if(group===3){
+  const sentences=String(item.passage||'').match(/[^.!?]+[.!?]+/g)||[];
+  if(sentences.length<4||sentences.length>5)problems.push('passage must contain 4 or 5 sentences');
+  if(String(item.passage||'').trim().length<140)problems.push('passage is too short');
+  if((item.a||[]).some(v=>equal(v)===equal(item.passage)))problems.push('summary option cannot copy passage');
+ }
+ return problems;
 }
 async function generateGrammarMini({key,model,profile,mini,attempt,weak,previous,signal}) {
   const fmt=GRAMMAR_FORMATS[mini];
@@ -46,12 +52,12 @@ async function generateGrammarMini({key,model,profile,mini,attempt,weak,previous
     const point=chosen[(mini*5+j)%chosen.length];
     let generated=null, last='';
     for (let trial=0;trial<3;trial++) {
-      const system=`Return valid JSON only, as {"question":{"stem":"...","a":["...","...","...","..."],"ok":0,"why":"...","learning_point":"..."${mini===2?',"words":"..."':''}${mini===3?',"rule":"..."':''}}. You are a Vietnamese adult EFL workplace assessment author. Produce ONE ${fmt.name} item at ${profile.level} level. TASK IS FIXED BY APPLICATION: ${fmt.instruction}. In stem give only the needed work situation and task data; do NOT add another vague question or reveal the answer. Copy learning_point exactly as the REQUIRED_POINT in the user input; do not choose another point. Four different options, only ONE objectively correct for the stated purpose. ok is the integer index (0-3). why explains the grammar rule and the contrast with a tempting wrong answer. Realistic spoken workplace context for ${profile.job}. Avoid shipping/delivery scenarios unless supplied. ${mini===0||mini===1?'Use a short sentence with a gap marked ____. Options are short forms/phrases, only one satisfies all grammatical cues.':''} ${mini===2?'words must show the shuffled word bank; each a option is a full sentence using those same words exactly once. Ensure only one word order is correct; include a clear grammar cue in stem.':''} ${mini===3?'stem contains an original sentence. rule names the requested transformation, e.g. convert to reported speech or conditional; options are rewritten full sentences. Keep original meaning, make three alternatives clearly violate the stated rule.':''} Use precise noncontroversial grammar. No two acceptable answers.`;
+      const system=`Return valid JSON only, as {"question":{"stem":"...","a":["...","...","...","..."],"ok":0,"why":"...","learning_point":"..."${mini===2?',"rule":"..."':''}${mini===3?',"passage":"..."':''}}. You are a careful English-for-work assessment author. Generate ONE item of type ${fmt.name} for a Vietnamese working adult at ${profile.level}. The exercise instruction is fixed by the app: ${fmt.instruction}. stem is ONLY the question data, with no instruction prefixes. Copy REQUIRED_POINT EXACTLY into learning_point. Provide four genuinely different options and only ONE objectively correct answer; ok must be its zero-based index. Three distractors should be plainly incorrect in meaning or grammar, never alternative acceptable wording. why identifies the specific evidence/rule and why other choices are wrong. Relevant context: ${profile.job}, ${profile.context}. ${mini===0?'stem is a natural workplace sentence containing exactly one ____ gap. a has four short choices. Include clear time and contextual cues so exactly one choice works.':''} ${mini===1?'stem gives a short workplace situation or conversational question. Four answers; only one is appropriate and grammatically correct.':''} ${mini===2?'stem is a complete ORIGINAL sentence without a gap. rule is an explicit required grammatical transformation, e.g. Rewrite in the passive voice. a contains four full rewritten sentences. Avoid reported speech where tense backshift can be optional; make one answer uniquely valid.':''} ${mini===3?'passage MUST contain 4 or 5 complete natural English sentences (around 55–85 words) about a cohesive realistic workplace situation, with the chosen learning point used naturally. stem is the short question: Which option best summarizes the passage? a contains four summary statements, only one capturing the passage central idea; distractors contradict the passage or overfocus on a minor detail. NEVER quote the correct answer in the question.':''} No placeholders or filename strings.`;
       try {
         const r=await call(key,model,system,{REQUIRED_POINT:point,profile,mini,item:j+1,attempt,weak_points:weak,previous_stems:[...previous,...questions.map(q=>q.stem)],previous_failure:last},AbortSignal.timeout(17000));
         const candidate=r.question;
         const issues=grammarCheck(candidate,point,mini);
-        if (!issues.length){generated={q:`${fmt.instruction} ${candidate.stem.trim()}${mini===2?' Words: '+candidate.words.trim():''}${mini===3?' Rule: '+candidate.rule.trim():''}`,a:candidate.a,ok:candidate.ok,why:candidate.why,learning_point:point,exercise_type:['correct_form','fill_gap','rearrange','transformation'][mini]};break}
+        if (!issues.length){generated={q:candidate.stem.trim(),passage:mini===3?candidate.passage.trim():undefined,rule:mini===2?candidate.rule.trim():undefined,a:candidate.a,ok:candidate.ok,why:candidate.why,learning_point:point,exercise_type:['fill_gap','multiple_choice','transformation','reading_summary'][mini]};break}
         last=issues.join('; ');
       } catch(e){last=String(e.message||e)}
     }
