@@ -33,7 +33,7 @@ $('create').onclick=async()=>{
  btn.disabled=true;btn.textContent='Generating personalized exercises…';$('setupError').textContent='Please keep this page open while AI prepares five sessions.';
  try{
    const res=await fetch('/.netlify/functions/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});
-   const payload=await res.json().catch(()=>({}));if(!res.ok)throw new Error(payload.error||'AI generation failed.');
+   const payload=await res.json().catch(()=>({}));if(!res.ok)throw new Error((payload.error||'AI generation failed.')+(Array.isArray(payload.details)&&payload.details.length?' Details: '+payload.details.slice(0,3).join(' | '):''));
    if(!Array.isArray(payload.parts)||payload.parts.length!==5||payload.parts.some(part=>!Array.isArray(part)||part.length!==5))throw Error('AI returned an incomplete practice set. Please try again.');
    const before=JSON.stringify(profile);DATA=payload.parts;
    if(before!==JSON.stringify(p)){scores=[null,null,null,null,null];save()}
