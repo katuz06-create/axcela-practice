@@ -33,14 +33,45 @@ Do not output anything in addition to this schema. Ensure all instructions are c
       if (/^(?:audio|mp3|audio mp3|play audio|listen|placeholder|sample audio)$/i.test(t)) return false;
       return true;
     };
-    const norm = t => String(t).trim().toLowerCase().replace(/[^a-z0-9]+/g,' ');
-    const isGoodInstruction = t => typeof t === 'string' && t.trim().length >= 24 && /(?:\?|choose|select|complete|which|what|why|how|listen|repeat|record|read|fill|transform|combine|respond|reply|meaning|correct)/i.test(t);
-    const validParts = parts => Array.isArray(parts) && parts.length === 5 && parts.every((part, i) =>
-      Array.isArray(part) && part.length === 5 && part.every(x => x && isGoodInstruction(x.q) &&
-        typeof x.learning_point === 'string' && profile.points.some(p=>norm(p)===norm(x.learning_point)) &&
-        (i===0 || i===2 || typeof x.audio==='string' && validAudio(x.audio)) &&
-        (i===3 ? !x.a : Array.isArray(x.a) && x.a.length===4 && x.a.every(v=>typeof v==='string' && v.trim().length>=3) && new Set(x.a.map(norm)).size===4 && Number.isInteger(x.ok) && x.ok>=0 && x.ok<4 && typeof x.why==='string' && x.why.trim().length>=18)
-      ));
+    const norm = t => String(t || '').trim().toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+    const isGoodInstruction = t => typeof t === 'string' && t.trim().length >= 18 && /(?:\?|choose|select|complete|which|what|why|how|listen|repeat|record|read|fill|transform|combine|respond|reply|meaning|correct|best|appropriate)/i.test(t);
+    // Normalize common harmless model-output differences, never fabricate answers or correct keys.
+    const normalizeParts = parts => {
+      if (!Array.isArray(parts)) return parts;
+      return parts.map((part,i) => !Array.isArray(part) ? part : part.map(x => {
+        if (!x || typeof x !== 'object') return x;
+        const y = {...x};
+        if (typeof y.learning_point === 'string') {
+          const found = profile.points.find(p => norm(p) === norm(y.learning_point));
+          if (found) y.learning_point = found;
+        }
+        if (i===3 && Array.isArray(y.a) && y.a.length===0) delete y.a;
+        if (typeof y.ok === 'string' && /^[0-3]$/.test(y.ok)) y.ok = Number(y.ok);
+        return y;
+      }));
+    };
+    const structuralIssues = parts => {
+      const issues=[];
+      if (!Array.isArray(parts) || parts.length!==5) return [{part:0,item:0,reason:'Must return five parts (Grammar, Listening, Vocabulary, Speaking, Conversation)'}];
+      parts.forEach((part,i)=>{
+        if(!Array.isArray(part)||part.length!==5){issues.push({part:i+1,item:0,reason:'Part must have five questions'});return;}
+        part.forEach((x,j)=>{
+          const problems=[];
+          if(!x||typeof x!=='object'){issues.push({part:i+1,item:j+1,reason:'Question is not an object'});return;}
+          if(!isGoodInstruction(x.q))problems.push('Missing actionable task instruction');
+          if(typeof x.learning_point!=='string'||!profile.points.some(p=>norm(p)===norm(x.learning_point)))problems.push('learning_point must exactly match one selected point');
+          if([1,3,4].includes(i)&&!validAudio(x.audio))problems.push('Audio must be real spoken English, not a filename or placeholder');
+          if(i===3){if(x.a!==undefined)problems.push('Speaking repeat item must not contain answer choices');}
+          else {
+            if(!Array.isArray(x.a)||x.a.length!==4||x.a.some(v=>typeof v!=='string'||v.trim().length<3)||new Set((x.a||[]).map(norm)).size!==4)problems.push('Four different, complete answer options required');
+            if(!Number.isInteger(x.ok)||x.ok<0||x.ok>3)problems.push('Correct-answer index must be 0–3');
+            if(typeof x.why!=='string'||x.why.trim().length<12)problems.push('A specific answer explanation is required');
+          }
+          if(problems.length) issues.push({part:i+1,item:j+1,reason:problems.join('; ')});
+        });
+      });
+      return issues;
+    };
     const review = async parts => {
       const prompt = `Act as an adversarial English assessment reviewer. Audit ALL 25 items in five parts. Check every MCQ has one and only one correct answer; other options MUST be wrong according to precisely stated task, not merely less preferred. Grammar: reject ambiguous or missing directions, answers already leaked in prompt, two correct grammatical constructions (especially relative clauses or verb tenses), invalid grammar. Listening: reject if answers are unsupported by literal audio or filenames. Vocabulary: reject synonyms that both work. Speaking: clear instruction and realistic repeatable audio. Conversation: reject multiple equally professional responses. Reject if role/CEFR/learning points are inconsistent. Return strict JSON {"pass":boolean,"issues":[{"part":1,"item":1,"reason":"..."}]} (up to 12 most severe). Conservative: if uncertain FAIL.`;
       const r=await fetch('https://api.openai.com/v1/chat/completions',{method:'POST',headers:{Authorization:`Bearer ${key}`,'Content-Type':'application/json'},body:JSON.stringify({model:process.env.OPENAI_REVIEW_MODEL||process.env.OPENAI_MODEL||'gpt-4o-mini',temperature:0,response_format:{type:'json_object'},messages:[{role:'system',content:prompt},{role:'user',content:JSON.stringify({profile,parts})}]})});
@@ -49,23 +80,69 @@ Do not output anything in addition to this schema. Ensure all instructions are c
       const verdict=JSON.parse(obj.choices?.[0]?.message?.content||'{}');
       return verdict.pass===true && Array.isArray(verdict.issues) && verdict.issues.length===0 ? {pass:true,issues:[]} : {pass:false,issues:Array.isArray(verdict.issues)?verdict.issues:[]};
     };
-    let parsed, lastError='', failedIssues=[];
-    for (let attempt=0;attempt<3;attempt++) {
-      const extra = attempt ? `\nREGENERATE THE FULL SET. Previous failed quality checks: ${JSON.stringify(failedIssues).slice(0,4000)}. Fix ALL issues. Strict one correct answer only. Explicit directions in every question. Audio is actual spoken script.` : '';
-      const r=await fetch('https://api.openai.com/v1/chat/completions',{
-        method:'POST',headers:{Authorization:`Bearer ${key}`,'Content-Type':'application/json'},body:JSON.stringify({model:process.env.OPENAI_MODEL||'gpt-4o-mini',temperature:0.2,response_format:{type:'json_object'},messages:[{role:'system',content:instructions+extra},{role:'user',content:JSON.stringify(profile)}]})
+    const requestJson = async (system, user, model, temperature=0.2) => {
+      const r = await fetch('https://api.openai.com/v1/chat/completions', {
+        method:'POST', headers:{Authorization:`Bearer ${key}`, 'Content-Type':'application/json'},
+        body:JSON.stringify({model, temperature, response_format:{type:'json_object'}, messages:[{role:'system',content:system},{role:'user',content:JSON.stringify(user)}]})
       });
-      const api=await r.json().catch(()=>({}));
-      if(!r.ok)return Response.json({error:api.error?.message||'OpenAI generation unavailable'},{status:502});
-      try{parsed=JSON.parse(api.choices?.[0]?.message?.content||'{}')}catch{parsed=null}
-      if(!parsed||!validParts(parsed.parts)) {failedIssues=[{reason:'Invalid schema, instructions, learning points or spoken text'}];parsed=null;lastError='Content did not pass structural checks';continue}
-      let verdict;
-      try{verdict=await review(parsed.parts)}catch(e){return Response.json({error:'Quality review unavailable: '+e.message+'. No exercises were published.'},{status:502})}
-      if(verdict.pass)break;
-      failedIssues=verdict.issues.length?verdict.issues:[{reason:'Reviewer rejected ambiguity or incorrect answers'}];
-      lastError='Generated questions did not pass content quality review';parsed=null;
+      const obj=await r.json().catch(()=>({}));
+      if(!r.ok) throw new Error(obj.error?.message || 'OpenAI request failed');
+      try { return JSON.parse(obj.choices?.[0]?.message?.content || '{}'); }
+      catch { throw new Error('OpenAI returned invalid JSON'); }
+    };
+    const generationModel=process.env.OPENAI_MODEL||'gpt-4o-mini';
+    let parsed=await requestJson(instructions,profile,generationModel);
+    if(!parsed || !Array.isArray(parsed.parts) || parsed.parts.length!==5 || parsed.parts.some(x=>!Array.isArray(x)||x.length!==5)) {
+      return Response.json({error:'AI did not return five complete parts of five questions. No exercises were published.',code:'INVALID_SET_SHAPE'}, {status:422});
     }
-    if (!parsed) return Response.json({error: lastError + '. Please generate again.'}, {status: 502});
+    parsed.parts=normalizeParts(parsed.parts);
+    const issueKey = x => `${x.part}:${x.item}`;
+    const normalizeIssue = x => ({part:Number(x.part),item:Number(x.item),reason:String(x.reason||'Question failed review').slice(0,360)});
+    const collectIssues = async () => {
+      const structural=structuralIssues(parsed.parts).map(normalizeIssue);
+      // Inspect only structurally valid questions in semantic review; preserve the invalid positions for targeted repair.
+      let semantic=[];
+      if(!structural.length) {
+        const verdict=await review(parsed.parts);
+        semantic=verdict.pass ? [] : (verdict.issues||[]).map(normalizeIssue);
+        // A review without actionable coordinates is not evidence of passing.
+        if(!verdict.pass && !semantic.length) semantic=[{part:0,item:0,reason:'Review rejected content but did not identify an item'}];
+      }
+      return [...structural,...semantic];
+    };
+    let issues=await collectIssues();
+    // Repair only the failed positions, while preserving all already-approved questions.
+    // Two attempts plus one simpler fallback per item. Each replacement is validated again.
+    for(let attempt=1;attempt<=3 && issues.length;attempt++) {
+      const targets=new Map();
+      for(const issue of issues){
+        if(!Number.isInteger(issue.part)||!Number.isInteger(issue.item)||issue.part<1||issue.part>5||issue.item<1||issue.item>5) continue;
+        const k=issueKey(issue);
+        if(!targets.has(k)) targets.set(k,[]);
+        targets.get(k).push(issue.reason);
+      }
+      if(!targets.size) break;
+      for(const [where,reasons] of targets){
+        const [part,item]=where.split(':').map(Number);
+        const old=parsed.parts[part-1][item-1];
+        const repairSystem=`You are an EFL assessment editor. Replace EXACTLY ONE invalid question. Return only JSON {"question":{...}}. The replacement must follow the schema of part ${part} in these full instructions:\n${instructions}\nDo not alter any other items. Use a precise explicit learner-facing instruction, authentic workplace speech, one unambiguously correct MCQ option, and ensure the answer is supported by the prompt/audio. ${attempt===3?'Use a SIMPLE, highly constrained question type with one objectively correct answer.':''}`;
+        try{
+          const out=await requestJson(repairSystem,{profile,part,item,previous_question:old,failed_checks:reasons,other_questions_in_part:parsed.parts[part-1].filter((_,idx)=>idx!==item-1)},generationModel,0.1);
+          const candidate=normalizeParts(Array.from({length:5},(_,i)=>i===part-1?[out.question]:[]))?.[part-1]?.[0];
+          if(!candidate || typeof candidate!=='object') continue;
+          // Validate in the complete set; never publish partial repairs.
+          const previous=parsed.parts[part-1][item-1];
+          parsed.parts[part-1][item-1]=candidate;
+          if(structuralIssues(parsed.parts).some(x=>x.part===part&&x.item===item)) parsed.parts[part-1][item-1]=previous;
+        }catch(e){ /* Keep old question and retry on next pass. */ }
+      }
+      issues=await collectIssues();
+    }
+    if(issues.length) return Response.json({
+      error:'Some questions could not pass the Exercise Quality Gate after automatic repair. No new journey was published.',
+      details:issues.slice(0,8).map(x=>`Part ${x.part||'?'} / Question ${x.item||'?'}: ${x.reason}`),
+      code:'EXERCISE_QUALITY_FAILED'
+    },{status:422});
     return Response.json({ parts: parsed.parts }, { headers: { 'Cache-Control': 'no-store' } });
   } catch (e) { return Response.json({ error: e.message || 'Generation failed' }, { status: 500 }); }
 };
