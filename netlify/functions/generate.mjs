@@ -1,3 +1,4 @@
+// Axcela Practice Engine Grammar V1 - constrained templates, on-demand 5-item minis.
 // Axcela Practice Engine V0.4.4 - validated JSON and targeted repair, compatible with V0.4 index.html. One 20-item part per request; never expose secrets.
 const NAMES=['Grammar comprehension','Listening comprehension','Vocabulary in context','Listen & Speak','Guided AI conversation'];
 const tasks=[
@@ -17,6 +18,49 @@ function normalizeItem(q,p,points){if(!q||typeof q!=='object'||Array.isArray(q))
 
 function errors(q,p,points){let a=[];if(!q||typeof q!=='object')return ['missing object'];if(typeof q.q!=='string'||q.q.trim().length<24||!/(choose|select|which|what|how|complete|correct|fill|listen|repeat|record|reply|respond|transform|rearrange)/i.test(q.q))a.push('unclear task');if(!points.some(s=>norm(s)===norm(q.learning_point)))a.push('incorrect learning_point');if(p===1||p===3||p===4){if(!audioValid(q.audio))a.push('invalid spoken audio script')};if(p!==3){if(!Array.isArray(q.a)||q.a.length!==4||q.a.some(v=>typeof v!=='string'||v.trim().length<2)||new Set((q.a||[]).map(norm)).size!==4)a.push('four unique answers required');if(!Number.isInteger(q.ok)||q.ok<0||q.ok>3)a.push('invalid correct index');if(!q.why||String(q.why).length<15)a.push('answer explanation missing')}else if(q.a?.length)a.push('repeat exercise must not have choices');return a}
 async function call(key,model,sys,user,signal){let response=await fetch('https://api.openai.com/v1/chat/completions',{method:'POST',signal,headers:{Authorization:`Bearer ${key}`,'Content-Type':'application/json'},body:JSON.stringify({model,response_format:{type:'json_object'},temperature:0.25,messages:[{role:'system',content:'Return a valid JSON object only. JSON is required. '+sys},{role:'user',content:'Return JSON only for this input: '+JSON.stringify(user)}]})});let obj=await response.json().catch(()=>({}));if(!response.ok)throw Error(obj.error?.message||`OpenAI HTTP ${response.status}`);let v;try{v=JSON.parse(obj.choices?.[0]?.message?.content||'{}')}catch{throw Error('OpenAI returned invalid JSON')}return v}
+// Grammar Engine V1: controlled question types; five individually generated items per mini.
+const GRAMMAR_FORMATS = [
+  { name:'Choose the correct verb form', instruction:'Choose the correct grammatical form to complete the workplace sentence.' },
+  { name:'Complete the sentence', instruction:'Choose the option that correctly completes the gap in the workplace sentence.' },
+  { name:'Rearrange the words', instruction:'Choose the option that puts the given words in the correct order to form a natural English sentence.' },
+  { name:'Transform the sentence', instruction:'Choose the correct sentence transformation using the stated grammar rule without changing the intended meaning.' }
+];
+function grammarCheck(item, chosenPoint, group) {
+  const problems=[];
+  if (!item || typeof item !== 'object' || Array.isArray(item)) return ['missing question object'];
+  const equal = s => String(s||'').trim().toLowerCase().replace(/\s+/g,' ');
+  if (equal(item.learning_point)!==equal(chosenPoint)) problems.push('learning_point mismatch');
+  if (!Array.isArray(item.a)||item.a.length!==4||item.a.some(x=>typeof x!=='string'||x.trim().length<2)||new Set((item.a||[]).map(equal)).size!==4) problems.push('four distinct nonempty answers required');
+  if (!Number.isInteger(item.ok)||item.ok<0||item.ok>3)problems.push('ok must be integer 0-3');
+  if (typeof item.stem!=='string'||item.stem.trim().length<12)problems.push('stem must contain workplace context and task data');
+  if (typeof item.why!=='string'||item.why.trim().length<18)problems.push('specific explanation missing');
+  if (group===2 && (typeof item.words!=='string'||item.words.trim().split(/\s+/).length<5)) problems.push('word bank required for rearrange');
+  if (group===3 && (typeof item.rule!=='string'||item.rule.trim().length<5)) problems.push('transformation rule required');
+  return problems;
+}
+async function generateGrammarMini({key,model,profile,mini,attempt,weak,previous,signal}) {
+  const fmt=GRAMMAR_FORMATS[mini];
+  const chosen=profile.points;
+  const questions=[];
+  for (let j=0;j<5;j++) {
+    const point=chosen[(mini*5+j)%chosen.length];
+    let generated=null, last='';
+    for (let trial=0;trial<3;trial++) {
+      const system=`Return valid JSON only, as {"question":{"stem":"...","a":["...","...","...","..."],"ok":0,"why":"...","learning_point":"..."${mini===2?',"words":"..."':''}${mini===3?',"rule":"..."':''}}. You are a Vietnamese adult EFL workplace assessment author. Produce ONE ${fmt.name} item at ${profile.level} level. TASK IS FIXED BY APPLICATION: ${fmt.instruction}. In stem give only the needed work situation and task data; do NOT add another vague question or reveal the answer. Copy learning_point exactly as the REQUIRED_POINT in the user input; do not choose another point. Four different options, only ONE objectively correct for the stated purpose. ok is the integer index (0-3). why explains the grammar rule and the contrast with a tempting wrong answer. Realistic spoken workplace context for ${profile.job}. Avoid shipping/delivery scenarios unless supplied. ${mini===0||mini===1?'Use a short sentence with a gap marked ____. Options are short forms/phrases, only one satisfies all grammatical cues.':''} ${mini===2?'words must show the shuffled word bank; each a option is a full sentence using those same words exactly once. Ensure only one word order is correct; include a clear grammar cue in stem.':''} ${mini===3?'stem contains an original sentence. rule names the requested transformation, e.g. convert to reported speech or conditional; options are rewritten full sentences. Keep original meaning, make three alternatives clearly violate the stated rule.':''} Use precise noncontroversial grammar. No two acceptable answers.`;
+      try {
+        const r=await call(key,model,system,{REQUIRED_POINT:point,profile,mini,item:j+1,attempt,weak_points:weak,previous_stems:[...previous,...questions.map(q=>q.stem)],previous_failure:last},AbortSignal.timeout(17000));
+        const candidate=r.question;
+        const issues=grammarCheck(candidate,point,mini);
+        if (!issues.length){generated={q:`${fmt.instruction} ${candidate.stem.trim()}${mini===2?' Words: '+candidate.words.trim():''}${mini===3?' Rule: '+candidate.rule.trim():''}`,a:candidate.a,ok:candidate.ok,why:candidate.why,learning_point:point,exercise_type:['correct_form','fill_gap','rearrange','transformation'][mini]};break}
+        last=issues.join('; ');
+      } catch(e){last=String(e.message||e)}
+    }
+    if (!generated)throw Error(`Grammar Mini ${mini+1} Question ${j+1} could not be validated: ${last}`);
+    questions.push(generated);
+  }
+  return questions;
+}
+
 // V0.4.3: strictly ONE mini-exercise (5 questions) per request.
 // Never preload. The browser explicitly requests each mini in sequence.
 export default async request=>{
@@ -30,6 +74,14 @@ export default async request=>{
   const profile={job:clean(p.job,130),context:clean(p.context,500),level:p.level,website:clean(p.website,180),points:p.points.map(x=>clean(x,75))};
   const model=process.env.OPENAI_MODEL||'gpt-4o-mini';const weak=Array.isArray(body.weak_points)?body.weak_points.slice(0,5).map(x=>clean(x,75)):[];
   const attempt=Math.max(1,Math.min(100,Number(body.attempt)||1));
+
+  if(part===0){
+    step='grammar controlled generation';
+    const questions=await generateGrammarMini({key,model,profile,mini:group,attempt,weak,previous:Array.isArray(body.previous_questions)?body.previous_questions.slice(0,10):[]});
+    console.log(JSON.stringify({event:'grammar_mini_ready',mini:group,attempt,count:questions.length,ms:Date.now()-started}));
+    return Response.json({part,mini:group,questions,attempt},{headers:{'Cache-Control':'no-store'}});
+  }
+
   const typeName=part===0?['choose correct grammatical form','complete a gap','correct an error / choose correct word order','transform with explicit task'][group]:part===1?['identify stated detail','identify explicit reason','understand next step','identify stated intention'][group]:part===2?['meaning in context','collocation','professional tone','functional phrase'][group]:part===3?['making requests','giving status updates','explaining problems','proposing solutions'][group]:['asking for clarification','responding to an issue','disagreeing politely','agreeing next steps'][group];
   const base=`You are an expert English-for-work exercise author for Vietnamese adults. This is Part ${part+1} (${NAMES[part]}) mini-exercise ${group+1} of 4. Create EXACTLY FIVE DISTINCT items of the following kind: ${typeName}. Keep situations realistic for the given job and speaking context, CEFR ${profile.level}, and selected points. Website is a domain hint only, not verified research. Every question has q (an EXPLICIT actionable learner instruction that clearly states the task) and learning_point (COPY VERBATIM one of the learner's selected points; never paraphrase it). Output JSON only. For multiple-choice questions add a (exactly four nonempty, distinct string options), ok (INTEGER 0,1,2,3 indexing the correct answer), why (specific explanation of at least 15 characters). Output all required keys on EVERY item.  ONE answer must be objectively right; alternative correct phrasings are NOT valid distractors. Audio sections use audio as actual spoken English of >=7 words, NEVER a file name. Part 4 is repetition: q says listen and record; audio is spoken sentence; no answer choices. Do not leak answers in q. ${tasks[part]} Return ONLY JSON {"questions":[five item objects]}. Do not include markdown or commentary.`;
   const check=(questions)=>questions.map((q,i)=>({i,reasons:errors(q,part,profile.points)})).filter(x=>x.reasons.length);
