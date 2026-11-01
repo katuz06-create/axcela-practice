@@ -91,10 +91,50 @@ Do not output anything in addition to this schema. Ensure all instructions are c
       catch { throw new Error('OpenAI returned invalid JSON'); }
     };
     const generationModel=process.env.OPENAI_MODEL||'gpt-4o-mini';
-    let parsed=await requestJson(instructions,profile,generationModel);
-    if(!parsed || !Array.isArray(parsed.parts) || parsed.parts.length!==5 || parsed.parts.some(x=>!Array.isArray(x)||x.length!==5)) {
-      return Response.json({error:'AI did not return five complete parts of five questions. No exercises were published.',code:'INVALID_SET_SHAPE'}, {status:422});
+    // Initial response may be incomplete. Repair its SHAPE before the question-level Quality Gate.
+    // A missing part/question cannot be reached by the old item-repair loop, so rebuild that part.
+    const partNames=['Grammar','Listening','Vocabulary','Listen & Speak','Guided Conversation'];
+    let parsed={};
+    try { parsed=await requestJson(instructions,profile,generationModel); }
+    catch(e) { parsed={parts:[]}; }
+    const incoming=Array.isArray(parsed?.parts)?parsed.parts:[];
+    const parts=Array.from({length:5},(_,i)=>Array.isArray(incoming[i])?incoming[i].slice(0,5):[]);
+    const isComplete=part=>Array.isArray(part)&&part.length===5&&part.every(x=>x&&typeof x==='object'&&!Array.isArray(x));
+    // Generate only missing/incomplete parts, never discard the whole journey prematurely.
+    const buildPart=async i=>{
+      const partNumber=i+1;
+      const system=`${instructions}\nOVERRIDE OUTPUT SHAPE FOR THIS REQUEST: Return ONLY JSON object {"questions":[exactly five question objects]} for PART ${partNumber}: ${partNames[i]}. Do not output other parts, markdown or explanatory text. The five question objects must follow the Part${partNumber} schema in the above instructions. Each question is separate and independently answerable.`;
+      for(let retry=0;retry<3;retry++) {
+        try {
+          const reply=await requestJson(system,{profile,part:partNumber,existing_questions:parts[i],requested_count:5},generationModel,retry?0.1:0.2);
+          const candidates=Array.isArray(reply.questions)?reply.questions:(Array.isArray(reply.part)?reply.part:[]);
+          if(isComplete(candidates))return candidates;
+        }catch(e) { /* Try again; never publish partial content. */ }
+      }
+      // Last fallback: build five positions individually to avoid long/truncated arrays.
+      const recovered=[];
+      for(let j=0;j<5;j++) {
+        const oneSystem=`${instructions}\nOVERRIDE OUTPUT SHAPE: Return ONLY {"question":{...}}. Write one complete, independent question for Part ${partNumber} (${partNames[i]}), item ${j+1} of 5. Include every required schema field for this part.`;
+        let done=false;
+        for(let attempt=0;attempt<2&&!done;attempt++) {
+          try{
+            const reply=await requestJson(oneSystem,{profile,part:partNumber,item:j+1,previous_questions:recovered},generationModel,0.1);
+            if(reply.question&&typeof reply.question==='object'&&!Array.isArray(reply.question)){recovered.push(reply.question);done=true;}
+          }catch(e) { /* Preserve failure for clear message below. */ }
+        }
+        if(!done)break;
+      }
+      return recovered;
+    };
+    // Independent parts can be retried without redoing valid ones.
+    const deficient=parts.map((part,i)=>isComplete(part)?-1:i).filter(i=>i>=0);
+    const rebuilt=await Promise.all(deficient.map(async i=>({i,part:await buildPart(i)})));
+    for(const x of rebuilt)parts[x.i]=x.part;
+    if(parts.some(p=>!isComplete(p))){
+      const incomplete=parts.map((p,i)=>!isComplete(p)?`${partNames[i]} (${p?.length||0}/5)`:null).filter(Boolean);
+      return Response.json({error:`Could not complete: ${incomplete.join(', ')}. AI retried incomplete parts and questions; existing journey was preserved.`,code:'INVALID_SET_SHAPE',details:incomplete},{status:422});
     }
+    parsed={parts};
     parsed.parts=normalizeParts(parsed.parts);
     const issueKey = x => `${x.part}:${x.item}`;
     const normalizeIssue = x => ({part:Number(x.part),item:Number(x.item),reason:String(x.reason||'Question failed review').slice(0,360)});
