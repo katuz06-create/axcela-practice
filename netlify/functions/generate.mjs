@@ -1,4 +1,4 @@
-// Axcela Practice Engine V0.4. One 20-item part per request; never expose secrets.
+// Axcela Practice Engine V0.4.1 - compatible with V0.4 index.html. One 20-item part per request; never expose secrets.
 const NAMES=['Grammar comprehension','Listening comprehension','Vocabulary in context','Listen & Speak','Guided AI conversation'];
 const tasks=[
  'Four mini exercises of 5 MCQs: (1) choose grammatical form for a specific context, (2) fill a blank, (3) correct a sentence / choose correct word order, (4) transform a sentence with an explicit transformation instruction. Each question must be solvable with one uniquely correct option. No bare statement for question.',
